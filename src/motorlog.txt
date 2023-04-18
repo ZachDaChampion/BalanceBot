@@ -1,0 +1,5 @@
+0: off
+5: barely a noise
+10: consistent noise
+22: slow move
+-45: slow move
