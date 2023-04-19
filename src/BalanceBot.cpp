@@ -14,7 +14,8 @@
 // IMU params
 #define IMU_I2C_ADDRESS 0x4A
 #define IMU_I2C_SPEED 400000
-#define IMU_UPDATE_RATE 20
+#define IMU_UPDATE_RATE 10
+#define ANGLE_MAX_SPEED (30.0 * PI / 180.0)
 
 // Motor pins
 #define PIN_MOTOR_LEFT 9
@@ -32,6 +33,7 @@ BNO080 imu;
 Robot robot(3.14, 6.5, 100, 22, -26);
 MotorController motor_left(PIN_MOTOR_LEFT, false, -24, 20);
 MotorController motor_right(PIN_MOTOR_RIGHT, false, -24, 20);
+float angle_offset = 0;
 PID pid_roll;
 PID pid_yaw;
 
@@ -90,15 +92,15 @@ void setup()
    */
 
   // Primary balancing PID
-  pid_roll.kp = 350;
-  pid_roll.ki = 6;
-  pid_roll.kd = 2000;
+  pid_roll.kp = 0;
+  pid_roll.ki = 0;
+  pid_roll.kd = 0;
   pid_roll.min = -255;
   pid_roll.max = 255;
-  pid_roll.integral_zero_threshold = 0.08;
+  pid_roll.integral_zero_threshold = 0.008;
   pid_roll.reset_i_on_zero = true;
   pid_roll.clamp_integral = true;
-  pid_roll.derivative_smoothing = 0.25;
+  pid_roll.derivative_smoothing = 0.15;
 
   // Yaw correction PID
   pid_yaw.kp = 300 / PI;
@@ -146,14 +148,18 @@ void loop()
     // Get IMU data
     float roll = imu.getRoll();
     float yaw = imu.getYaw() - yaw_offset;
-    float roll_adjusted = roll - HALF_PI; // Adjust roll to be 0 when upright
+    float roll_adjusted
+        = roll - HALF_PI - angle_offset; // Adjust roll to be 0 when upright
 
     // Update robot state
     robot.updateState(roll_adjusted, yaw,
         (motor_left.getSpeed() + motor_right.getSpeed()) / 2, millis());
 
     // Calculate motor speed relative to roll
-    float motor_speed = pid_roll.update(roll_adjusted);
+    float error
+        = constrain(roll_adjusted / ANGLE_MAX_SPEED, -ANGLE_MAX_SPEED, ANGLE_MAX_SPEED);
+    error = error * error * error;
+    float motor_speed = pid_roll.update(error);
 
     // Turn on LED when motor is saturated
     if (motor_speed == 255 || motor_speed == -255) {
@@ -169,7 +175,17 @@ void loop()
     if (started) {
       motor_left.setSpeed(round(motor_speed + yaw_adjust));
       motor_right.setSpeed(round(motor_speed - yaw_adjust));
+
+      // Print data
+      Serial.print("a:");
+      Serial.print(roll_adjusted);
+      Serial.print(",e:");
+      Serial.println(error);
     }
+    // Serial.print("a:");
+    // Serial.print(roll_adjusted * 1000);
+    // Serial.print(",e:");
+    // Serial.println(error * 1000);
   }
 
   /*
@@ -202,11 +218,51 @@ void loop()
     started = true;
   }
 
-  // Stop motors on stop signal (Ctrl-C)
-  else if (serial_input == 0x03) {
+  // Stop motors on stop signal (Ctrl-C or 'e')
+  else if (serial_input == 0x03 || serial_input == 'e') {
     motor_left.setSpeed(0);
     motor_right.setSpeed(0);
     Serial.println(F("Motors stopped"));
     started = false;
+  }
+
+  // Update PID constants
+  else if (serial_input == 'p') {
+    char buffer[32];
+    size_t len = Serial.readBytesUntil('\n', buffer, 32);
+    buffer[len] = '\0';
+    pid_roll.kp = atof(buffer);
+    pid_roll.reset();
+  } else if (serial_input == 'i') {
+    char buffer[32];
+    size_t len = Serial.readBytesUntil('\n', buffer, 32);
+    buffer[len] = '\0';
+    pid_roll.ki = atof(buffer);
+    pid_roll.reset();
+  } else if (serial_input == 'd') {
+    char buffer[32];
+    size_t len = Serial.readBytesUntil('\n', buffer, 32);
+    buffer[len] = '\0';
+    pid_roll.kd = atof(buffer);
+    pid_roll.reset();
+  }
+
+  // Update angle offset
+  else if (serial_input == 'o') {
+    char buffer[32];
+    size_t len = Serial.readBytesUntil('\n', buffer, 32);
+    buffer[len] = '\0';
+    angle_offset = atof(buffer);
+    pid_roll.reset();
+  }
+
+  // Print PID constants
+  else if (serial_input == 'P') {
+    Serial.print(F("kp "));
+    Serial.println(pid_roll.kp);
+    Serial.print(F("ki "));
+    Serial.println(pid_roll.ki);
+    Serial.print(F("kd "));
+    Serial.println(pid_roll.kd);
   }
 }
