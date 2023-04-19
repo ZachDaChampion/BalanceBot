@@ -1,11 +1,17 @@
-#include <Arduino.h>
+#include <errno.h>
+#include <stdlib.h>
 
+#include <Arduino.h>
 #include <SparkFun_BNO080_Arduino_Library.h>
 #include <Wire.h>
 
+#include <config.h>
 #include <motor-controller.h>
-#include <pid.h>
 #include <robot.h>
+
+#ifdef USE_PID_CONTROLLER
+#include <controller-pid.h>
+#endif
 
 // IMU pins
 #define PIN_IMU_RESET 2
@@ -15,7 +21,6 @@
 #define IMU_I2C_ADDRESS 0x4A
 #define IMU_I2C_SPEED 400000
 #define IMU_UPDATE_RATE 10
-#define ANGLE_MAX_SPEED (30.0 * PI / 180.0)
 
 // Motor pins
 #define PIN_MOTOR_LEFT 9
@@ -29,16 +34,18 @@ bool new_accel_data = false;
 bool new_lin_accel_data = false;
 bool new_quat_data = false;
 
-BNO080 imu;
-Robot robot(3.14, 6.5, 100, 22, -26);
-MotorController motor_left(PIN_MOTOR_LEFT, false, -24, 20);
-MotorController motor_right(PIN_MOTOR_RIGHT, false, -24, 20);
-float angle_offset = 0;
-PID pid_roll;
-PID pid_yaw;
+// Global variables
+BNO080 imu; // IMU
+Robot robot(3.14, 6.5, 100, 22, -26); // Robot
+MotorController motor_left(PIN_MOTOR_LEFT, false, -24, 20); // Left motor controller
+MotorController motor_right(PIN_MOTOR_RIGHT, false, -24, 20); // Right motor controller
+bool running = false; // Is the robot running?
 
-long start_time;
-bool started = false;
+// Set controller
+#ifdef USE_PID_CONTROLLER
+ControllerPID controller;
+#endif
+
 void setup()
 {
 
@@ -67,16 +74,15 @@ void setup()
 
   imu.calibrateAll();
 
-  // Enable IMU interrupt
-  // attachInterrupt(digitalPinToInterrupt(PIN_IMU_INT), intHandler, FALLING);
-  // interrupts();
+// Enable IMU interrupt
+#if IMU_I2C_INTERRUPTS
+  attachInterrupt(digitalPinToInterrupt(PIN_IMU_INT), intHandler, FALLING);
+  interrupts();
+#endif
 
   // Setup IMU communication
   Wire.setClock(IMU_I2C_SPEED); // Set I2C data rate
   imu.enableRotationVector(IMU_UPDATE_RATE);
-  // imu.enableAccelerometer(IMU_UPDATE_RATE);
-  // imu.enableLinearAccelerometer(IMU_UPDATE_RATE);
-
   Serial.println(F("IMU enabled"));
 
   /*
@@ -88,24 +94,32 @@ void setup()
   Serial.println(F("Motors enabled"));
 
   /*
-   * Set up PID controllers
+   * Set up controller
    */
 
+#ifdef USE_PID_CONTROLLER
+
   // Primary balancing PID
-  pid_roll.kp = 0;
-  pid_roll.ki = 0;
-  pid_roll.kd = 0;
-  pid_roll.min = -255;
-  pid_roll.max = 255;
-  pid_roll.integral_zero_threshold = 0.008;
-  pid_roll.reset_i_on_zero = true;
-  pid_roll.clamp_integral = true;
-  pid_roll.derivative_smoothing = 0.15;
+  controller.params_angle.kp = 50;
+  controller.params_angle.ki = 500;
+  controller.params_angle.kd = 5;
+  controller.params_angle.kf = 40;
+  controller.params_angle.min_val = -255;
+  controller.params_angle.max_val = 255;
+  controller.params_angle.i_zero_threshold = 0.008;
+  controller.params_angle.reset_i_on_zero = true;
+  controller.params_angle.clamp_i = true;
+  controller.params_angle.d_smoothing = 0.15;
+  controller.angular_vel_smoothing = 0.25;
+  controller.torque_length = 3.35; // cm
+  controller.ff_add_gravity = true;
+  controller.ff_add_sensor = false;
 
   // Yaw correction PID
-  pid_yaw.kp = 300 / PI;
-  pid_yaw.min = -150;
-  pid_yaw.max = 150;
+  controller.params_yaw.kp = 300 / PI;
+  controller.params_yaw.min_val = -150;
+  controller.params_yaw.max_val = 150;
+#endif
 
   /*
    * Start
@@ -113,8 +127,9 @@ void setup()
 
   pinMode(PIN_LED, OUTPUT);
   Serial.println(F("Ready"));
-  start_time = millis();
 }
+
+#if IMU_I2C_INTERRUPTS
 
 /**
  * Interrupt handler for IMU data.
@@ -133,9 +148,9 @@ void intHandler()
     break;
   }
 }
+#endif
 
-long last_print = 0;
-float yaw_offset = 0;
+unsigned long last_print = 0;
 void loop()
 {
   /*
@@ -147,53 +162,53 @@ void loop()
 
     // Get IMU data
     float roll = imu.getRoll();
-    float yaw = imu.getYaw() - yaw_offset;
-    float roll_adjusted
-        = roll - HALF_PI - angle_offset; // Adjust roll to be 0 when upright
+    float yaw = imu.getYaw();
+    if (isnan(roll) || isnan(yaw)) {
+      return;
+    }
+    float roll_adjusted = roll - HALF_PI; // Adjust roll to be 0 when upright
 
     // Update robot state
     robot.updateState(roll_adjusted, yaw,
         (motor_left.getSpeed() + motor_right.getSpeed()) / 2, millis());
 
-    // Calculate motor speed relative to roll
-    float error
-        = constrain(roll_adjusted / ANGLE_MAX_SPEED, -ANGLE_MAX_SPEED, ANGLE_MAX_SPEED);
-    error = error * error * error;
-    float motor_speed = pid_roll.update(error);
+    // Update controller
+    Controller::MotorValues motor_vals = controller.update(roll_adjusted, yaw);
 
-    // Turn on LED when motor is saturated
-    if (motor_speed == 255 || motor_speed == -255) {
+    // Turn on LED when main controller is saturated
+    if (controller.isAngleSaturated()) {
       digitalWrite(PIN_LED, HIGH);
     } else {
       digitalWrite(PIN_LED, LOW);
     }
 
-    // Adjust motor speed to maintain 0 yaw
-    float yaw_adjust = pid_yaw.update(yaw);
-
     // Set motor speed
-    if (started) {
-      motor_left.setSpeed(round(motor_speed + yaw_adjust));
-      motor_right.setSpeed(round(motor_speed - yaw_adjust));
-
-      // Print data
-      Serial.print("a:");
-      Serial.print(roll_adjusted);
-      Serial.print(",e:");
-      Serial.println(error);
+    if (running) {
+      motor_left.setSpeed(motor_vals.left);
+      motor_right.setSpeed(motor_vals.right);
     }
-    // Serial.print("a:");
-    // Serial.print(roll_adjusted * 1000);
-    // Serial.print(",e:");
-    // Serial.println(error * 1000);
+
+    // Print data for serial plotter
+#if PRINT_SERIAL_PLOTTER
+#if PRINT_SERIAL_PLOTTER_NOT_RUNNING
+    if (1) {
+#else
+    if (running) {
+#endif
+      Serial.print(" t:");
+      Serial.print(roll_adjusted);
+      Serial.print(" y:");
+      Serial.println(yaw);
+    }
+#endif
   }
 
+#if PRINT_ROBOT_DATA
   /*
-   * Print data regularly
+   * Print data regularly.
    */
 
-#if 0
-  if (millis() - last_print > 500) {
+  if (millis() - last_print > PRINT_ROBOT_DATA_INTERVAL) {
     Serial.println(robot.toString());
     last_print = millis();
   }
@@ -208,14 +223,13 @@ void loop()
 
   // Start motors on start signal ('s')
   if (serial_input == 's') {
+    robot.reset();
+    controller.reset();
+    controller.setSetpointYaw(imu.getYaw());
     motor_left.setSpeed(0);
     motor_right.setSpeed(0);
-    robot.reset();
-    pid_roll.reset();
-    pid_yaw.reset();
-    yaw_offset = imu.getYaw();
     Serial.println(F("Motors started"));
-    started = true;
+    running = true;
   }
 
   // Stop motors on stop signal (Ctrl-C or 'e')
@@ -223,46 +237,68 @@ void loop()
     motor_left.setSpeed(0);
     motor_right.setSpeed(0);
     Serial.println(F("Motors stopped"));
-    started = false;
+    running = false;
   }
 
-  // Update PID constants
-  else if (serial_input == 'p') {
-    char buffer[32];
+  // Handle numeric input
+  else if (serial_input != -1) {
+    errno = 0;
+    static char buffer[32];
     size_t len = Serial.readBytesUntil('\n', buffer, 32);
     buffer[len] = '\0';
-    pid_roll.kp = atof(buffer);
-    pid_roll.reset();
-  } else if (serial_input == 'i') {
-    char buffer[32];
-    size_t len = Serial.readBytesUntil('\n', buffer, 32);
-    buffer[len] = '\0';
-    pid_roll.ki = atof(buffer);
-    pid_roll.reset();
-  } else if (serial_input == 'd') {
-    char buffer[32];
-    size_t len = Serial.readBytesUntil('\n', buffer, 32);
-    buffer[len] = '\0';
-    pid_roll.kd = atof(buffer);
-    pid_roll.reset();
-  }
+    float new_val = strtod(buffer, NULL);
 
-  // Update angle offset
-  else if (serial_input == 'o') {
-    char buffer[32];
-    size_t len = Serial.readBytesUntil('\n', buffer, 32);
-    buffer[len] = '\0';
-    angle_offset = atof(buffer);
-    pid_roll.reset();
-  }
+    if (errno == 0) {
+      switch (serial_input) {
 
-  // Print PID constants
-  else if (serial_input == 'P') {
-    Serial.print(F("kp "));
-    Serial.println(pid_roll.kp);
-    Serial.print(F("ki "));
-    Serial.println(pid_roll.ki);
-    Serial.print(F("kd "));
-    Serial.println(pid_roll.kd);
+      // Set controller setpoints
+      case 'a':
+        controller.setSetpointAngle(new_val);
+        break;
+      case 'y':
+        controller.setSetpointYaw(new_val);
+        break;
+
+#ifdef USE_PID_CONTROLLER
+
+      // Set PID parameters
+      case 'p':
+        controller.params_angle.kp = new_val;
+        break;
+      case 'i':
+        controller.params_angle.ki = new_val;
+        break;
+      case 'd':
+        controller.params_angle.kd = new_val;
+        break;
+      case 'f':
+        controller.params_angle.kf = new_val;
+        break;
+
+      // Print PID parameters
+      case 'P': {
+        Serial.println(F("ANGLE PID: "));
+        Serial.print(F("  kp: "));
+        Serial.println(controller.params_angle.kp);
+        Serial.print(F("  ki: "));
+        Serial.println(controller.params_angle.ki);
+        Serial.print(F("  kd: "));
+        Serial.println(controller.params_angle.kd);
+        Serial.print(F("  kf: "));
+        Serial.println(controller.params_angle.kf);
+        Serial.println(F("YAW PID: "));
+        Serial.print(F("  kp: "));
+        Serial.println(controller.params_yaw.kp);
+        Serial.print(F("  ki: "));
+        Serial.println(controller.params_yaw.ki);
+        Serial.print(F("  kd: "));
+        Serial.println(controller.params_yaw.kd);
+      } break;
+
+#endif
+      }
+    } else {
+      Serial.println(F("Invalid input"));
+    }
   }
 }
