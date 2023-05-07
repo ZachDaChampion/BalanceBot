@@ -46,6 +46,9 @@ bool running = false; // Is the robot running?
 ControllerPID controller;
 #endif
 
+// Forward declarations
+void calibrateImu();
+
 void setup()
 {
 
@@ -72,8 +75,6 @@ void setup()
     while (1) { }
   }
 
-  imu.calibrateAll();
-
 // Enable IMU interrupt
 #if IMU_I2C_INTERRUPTS
   attachInterrupt(digitalPinToInterrupt(PIN_IMU_INT), intHandler, FALLING);
@@ -83,6 +84,12 @@ void setup()
   // Setup IMU communication
   Wire.setClock(IMU_I2C_SPEED); // Set I2C data rate
   imu.enableRotationVector(IMU_UPDATE_RATE);
+
+// Calibrate IMU
+#if IMU_CONTINUOUS_CALIBRATION
+  imu.calibrateAll();
+#endif
+
   Serial.println(F("IMU enabled"));
 
   /*
@@ -103,15 +110,15 @@ void setup()
   controller.params_angle.kp = 50;
   controller.params_angle.ki = 500;
   controller.params_angle.kd = 5;
-  controller.params_angle.kf = 40;
+  controller.params_angle.kf = 10;
   controller.params_angle.min_val = -255;
   controller.params_angle.max_val = 255;
   controller.params_angle.i_zero_threshold = 0.008;
   controller.params_angle.reset_i_on_zero = true;
   controller.params_angle.clamp_i = true;
-  controller.params_angle.d_smoothing = 0.15;
-  controller.angular_vel_smoothing = 0.25;
-  controller.torque_length = 3.35; // cm
+  controller.params_angle.d_smoothing = 0.05;
+  controller.angular_vel_smoothing = 0.8;
+  controller.torque_length = 6.35; // cm
   controller.ff_add_gravity = true;
   controller.ff_add_sensor = false;
 
@@ -124,6 +131,10 @@ void setup()
   /*
    * Start
    */
+
+#if START_ON_BOOT
+  running = true;
+#endif
 
   pinMode(PIN_LED, OUTPUT);
   Serial.println(F("Ready"));
@@ -168,9 +179,13 @@ void loop()
     }
     float roll_adjusted = roll - HALF_PI; // Adjust roll to be 0 when upright
 
+#if PRINT_ROBOT_DATA
+
     // Update robot state
     robot.updateState(roll_adjusted, yaw,
         (motor_left.getSpeed() + motor_right.getSpeed()) / 2, millis());
+
+#endif
 
     // Update controller
     Controller::MotorValues motor_vals = controller.update(roll_adjusted, yaw);
@@ -240,6 +255,12 @@ void loop()
     running = false;
   }
 
+  // Calibrate IMU ('c')
+  else if (serial_input == 'c') {
+    calibrateImu();
+    controller.reset();
+  }
+
   // Handle numeric input
   else if (serial_input != -1) {
     errno = 0;
@@ -301,4 +322,119 @@ void loop()
       Serial.println(F("Invalid input"));
     }
   }
+}
+
+/**
+ * Print the accuracy of the an IMU parameter.
+ *
+ * \param num The accuracy number.
+ */
+inline void printAccuracy(int num)
+{
+  switch (num) {
+  case 0:
+    Serial.print("Unreliable");
+    break;
+  case 1:
+    Serial.print("Low");
+    break;
+  case 2:
+    Serial.print("Medium");
+    break;
+  case 3:
+    Serial.print("High");
+    break;
+  }
+}
+
+void calibrateImu()
+{
+
+  /*
+   * Configure IMU for calibration.
+   */
+
+  imu.enableGameRotationVector(100);
+  imu.enableMagnetometer(100);
+  imu.calibrateAll();
+
+  /*
+   * Print instructions.
+   */
+
+  Serial.println();
+  Serial.println(F("====== Calibration ======"));
+  Serial.println();
+  Serial.println(F("Please follow the instructions below to calibrate the IMU."));
+  Serial.println(
+      F("When you are done, enter the character 's' to save the calibration."));
+  Serial.println();
+  Serial.println(
+      F("1. Calibrate the accelerometer by rotating the robot in all directions."));
+  Serial.println(F("Hold the robot in each position for 1 second."));
+  Serial.println();
+  Serial.println(
+      F("2. Calibrate the gyroscope by setting device down on a flat surface "
+        "for 3 seconds."));
+  Serial.println();
+  Serial.println(
+      F("3. Calibrate the magnetometer by rotating the robot 180 degrees and "
+        "back in each axis."));
+  Serial.println(F("Each rotation should take 2 seconds."));
+  Serial.println();
+  Serial.println();
+  Serial.println();
+
+  /*
+   * Wait for calibration to be complete.
+   */
+
+  while (1) {
+
+    // Check if user wants to save calibration
+    char c = Serial.read();
+    if (c == 's') {
+      break;
+    }
+
+    // Print accuracy
+    if (imu.dataAvailable()) {
+      Serial.print(F("\033[F\033[FGyroscope accuracy: "));
+      printAccuracy(imu.getGyroAccuracy());
+      Serial.println();
+      Serial.print(F("Magnetometer accuracy: "));
+      printAccuracy(imu.getMagAccuracy());
+      Serial.println();
+    }
+  }
+
+  /*
+   * Save calibration.
+   */
+
+  Serial.println(F("Saving calibration..."));
+
+  imu.saveCalibration();
+  imu.requestCalibrationStatus();
+
+  size_t counter = 1000;
+  while (1) {
+    if (--counter == 0) {
+      Serial.println(F("Saving calibration failed!"));
+      break;
+    }
+
+    if (imu.dataAvailable()) {
+      if (imu.calibrationComplete()) {
+        Serial.println(F("Calibration complete!"));
+        break;
+      }
+    }
+
+    delay(1);
+  }
+
+#if !IMU_CONTINUOUS_CALIBRATION
+  imu.endCalibration();
+#endif
 }
